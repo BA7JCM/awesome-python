@@ -4,6 +4,7 @@
 import json
 import re
 import shutil
+import subprocess
 import xml.etree.ElementTree as ET
 from collections import Counter
 from collections.abc import Sequence
@@ -24,6 +25,7 @@ ANCHOR_LINK_ATTRS_RE = re.compile(r'href="(#[^"]*)" target="_blank" rel="noopene
 SITE_URL = "https://awesome-python.com/"
 SITEMAP_URL = f"{SITE_URL}sitemap.xml"
 SITEMAP_NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
+PLURAL_NOUNS = {"Clients", "Drivers", "Engines", "Files", "Frameworks", "Generators", "Implementations", "Panels", "Queues", "Repositories", "Schedulers", "Servers", "Stdlib", "Tools"}
 
 BUILTIN_FILTER = "Stdlib"
 BUILTIN_SLUG = "built-in"
@@ -71,6 +73,7 @@ class EntryGroup(TypedDict):
     name: str  # empty for a page with a single unnamed group
     slug: str
     url: str  # links the group heading to its own page, empty when it has none
+    lead: str  # the section intro's first paragraph as HTML, shown under the heading on group pages
     entries: list[TemplateEntry]
 
 
@@ -223,38 +226,42 @@ def build_homepage_json_ld(entries: Sequence[TemplateEntry], total_categories: i
 
 def category_meta_title(name: str, parent_name: str | None = None) -> str:
     if parent_name:
-        title = f"{name} for {parent_name} - Awesome Python"
-        if len(title) <= 60:
-            return title
-        title = f"{parent_name}: {name} - Awesome Python"
-        if len(title) <= 60:
-            return title
-        return f"{name} - Awesome Python"
-    title = f"Python {name} Libraries - Awesome Python"
+        # Lead with the section's title so the page matches searches like "python jwt library".
+        title = f"{category_meta_title(parent_name).removesuffix(' - Awesome Python')}: {name}"
+        # Google shows the site name above each result, so a long title drops it rather than get cut off.
+        return f"{title} - Awesome Python" if len(title) <= 43 else title
+    # Names ending in one of these nouns already say what the entries are.
+    noun = "" if name.rsplit(" ", 1)[-1] in PLURAL_NOUNS else " Libraries"
+    prefix = "" if name.startswith("Python ") else "Python "
+    title = f"{prefix}{name}{noun} - Awesome Python"
     if len(title) <= 60:
         return title
     return f"{name} - Awesome Python"
 
 
-def category_meta_description(name: str, entry_count: int, description: str, parent_name: str | None = None) -> str:
-    target = f"{name} for {parent_name}" if parent_name else name
-    count_sentence = f"Explore {entry_count} curated Python projects in {target}."
+def category_meta_description(name: str, entry_count: int, description: str) -> str:
+    count_sentence = f"Explore {entry_count} curated Python project{'s' if entry_count != 1 else ''} in {name}."
     if description:
         lead = description if description.endswith((".", "!", "?")) else f"{description}."
         return f"{lead} {count_sentence}"
     return f"{count_sentence} Part of the Awesome Python catalog."
 
 
-def load_category_intro(path: Path) -> tuple[str, str, str]:
+def subcategory_meta_description(name: str, parent_name: str, entry_names: Sequence[str]) -> str:
+    names = entry_names[0] if len(entry_names) == 1 else f"{', '.join(entry_names[:-1])}{',' if len(entry_names) > 2 else ''} and {entry_names[-1]}"
+    return f"The {name} picks in Awesome Python's {parent_name} list: {names}."
+
+
+def load_category_intro(path: Path) -> tuple[str, str, str, str]:
     """Render a category intro file to HTML, split at the end of its "How to choose:" list.
 
     Returns the part shown above the table, the guide shown below it, and the
-    first paragraph as plain text for the meta description. A file without the
-    list keeps everything above the table. Returns empty strings if the category
-    has no intro file.
+    first paragraph as plain text for the meta description and as HTML for
+    group pages. A file without the list keeps everything above the table.
+    Returns empty strings if the category has no intro file.
     """
     if not path.exists():
-        return "", "", ""
+        return "", "", "", ""
     md = MarkdownIt("commonmark")
     tokens = md.parse(path.read_text(encoding="utf-8"))
     for token in tokens:
@@ -269,7 +276,12 @@ def load_category_intro(path: Path) -> tuple[str, str, str]:
             split_at = next(j for j in range(i + 3, len(tokens)) if tokens[j].type == "bullet_list_close" and tokens[j].level == 0) + 1
             break
     render = md.renderer.render
-    return render(tokens[:split_at], md.options, {}), render(tokens[split_at:], md.options, {}), render_inline_text(lead.children[0].children)
+    return (
+        render(tokens[:split_at], md.options, {}),
+        render(tokens[split_at:], md.options, {}),
+        render_inline_text(lead.children[0].children),
+        render(lead.to_tokens(), md.options, {}),
+    )
 
 
 def group_section_entries(section: ParsedSection, entries_by_key: dict[tuple[str, str], TemplateEntry]) -> list[EntryGroup]:
@@ -278,12 +290,12 @@ def group_section_entries(section: ParsedSection, entries_by_key: dict[tuple[str
     for parsed in section["entries"]:
         name = parsed["subcategory"]
         slug = slugify(name) if name else ""
-        group = groups.setdefault(name, EntryGroup(name=name, slug=slug, url=subcategory_path(section["slug"], slug) if name else "", entries=[]))
+        group = groups.setdefault(name, EntryGroup(name=name, slug=slug, url=subcategory_path(section["slug"], slug) if name else "", lead="", entries=[]))
         group["entries"].append(entries_by_key[(parsed["url"], parsed["name"])])
     return list(groups.values())
 
 
-def group_entries_by_section(sections: Sequence[ParsedSection], entries_by_key: dict[tuple[str, str], TemplateEntry]) -> list[EntryGroup]:
+def group_entries_by_section(sections: Sequence[ParsedSection], entries_by_key: dict[tuple[str, str], TemplateEntry], intros_dir: Path) -> list[EntryGroup]:
     """Group a thematic group's entries by section, both in README order, listing each entry once."""
     placed: set[tuple[str, str]] = set()
     groups: list[EntryGroup] = []
@@ -294,7 +306,7 @@ def group_entries_by_section(sections: Sequence[ParsedSection], entries_by_key: 
             if key not in placed:
                 placed.add(key)
                 entries.append(entries_by_key[key])
-        groups.append(EntryGroup(name=section["name"], slug=section["slug"], url=category_path(section), entries=entries))
+        groups.append(EntryGroup(name=section["name"], slug=section["slug"], url=category_path(section), lead=load_category_intro(intros_dir / f"{section['slug']}.md")[3], entries=entries))
     return groups
 
 
@@ -389,6 +401,20 @@ def subcategory_public_url(category_slug: str, subcategory_slug: str) -> str:
 
 def synthetic_category(name: str, slug: str) -> SyntheticCategory:
     return {"name": name, "slug": slug, "description": "", "description_html": ""}
+
+
+def git_last_change_date(repo_root: Path, *log_args: str) -> str:
+    """Return the date of the last commit matching `git log` args, or "" without git history."""
+    result = subprocess.run(["git", "log", "-1", "--format=%cs", "--no-patch", *log_args], cwd=repo_root, capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def section_line_range(readme_text: str, name: str) -> str:
+    """Return a section's README lines as a `git log -L` range, from its heading to the line before the next heading."""
+    lines = readme_text.split("\n")
+    start = next(i for i, line in enumerate(lines) if re.fullmatch(rf"#+ {re.escape(name)}", line))
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("#")), len(lines))
+    return f"{start + 1},{end}:README.md"
 
 
 def write_sitemap_xml(path: Path, urls: Sequence[tuple[str, str]]) -> None:
@@ -749,8 +775,13 @@ def build(repo_root: Path) -> None:
         page_dir.mkdir(parents=True, exist_ok=True)
         parent_name = parent_category["name"] if parent_category else None
         category_title = category_meta_title(category["name"], parent_name)
-        intro_html, guide_html, intro_lead = load_category_intro(website / "data" / "category_intros" / f"{current_path.removeprefix('/categories/').strip('/')}.md")
-        category_description = intro_lead or category_meta_description(category["name"], len(entries), category["description"], parent_name)
+        intro_html, guide_html, intro_lead, _ = load_category_intro(website / "data" / "category_intros" / f"{current_path.removeprefix('/categories/').strip('/')}.md")
+        if intro_lead:
+            category_description = intro_lead
+        elif parent_name:
+            category_description = subcategory_meta_description(category["name"], parent_name, [e["name"] for e in entries])
+        else:
+            category_description = category_meta_description(category["name"], len(entries), category["description"])
         breadcrumbs = [("Awesome Python", SITE_URL)]
         if parent_category:
             breadcrumbs.append((parent_category["name"], category_public_url(parent_category)))
@@ -801,7 +832,7 @@ def build(repo_root: Path) -> None:
             current_path=group_path(group["slug"]),
             page_dir=categories_dir / group["slug"],
             group_categories=group["categories"],
-            entry_groups=group_entries_by_section(group["categories"], entries_by_key),
+            entry_groups=group_entries_by_section(group["categories"], entries_by_key, website / "data" / "category_intros"),
         )
 
     if builtin_entries:
@@ -851,7 +882,7 @@ def build(repo_root: Path) -> None:
             current_path=subcategory_path(cat_slug, sub_slug),
             page_dir=categories_dir / cat_slug / sub_slug,
             parent_category=cat_by_slug[cat_slug],
-            entry_groups=[EntryGroup(name="", slug="", url="", entries=group["entries"]) for group in section_groups[cat_by_slug[cat_slug]["name"]] if group["name"] == sub_name],
+            entry_groups=[EntryGroup(name="", slug="", url="", lead="", entries=group["entries"]) for group in section_groups[cat_by_slug[cat_slug]["name"]] if group["name"] == sub_name],
         )
 
     redirects_file = website / "data" / "redirects.json"
@@ -871,8 +902,6 @@ def build(repo_root: Path) -> None:
     if static_src.exists():
         shutil.copytree(static_src, static_dst, dirs_exist_ok=True)
 
-    sponsorship_md = repo_root / "SPONSORSHIP.md"
-    sponsorship_md_mtime = datetime.fromtimestamp(sponsorship_md.stat().st_mtime, tz=UTC).date().isoformat()
     llms_template = (website / "templates" / "llms.txt").read_text(encoding="utf-8")
     llms_txt = build_llms_txt(
         llms_template,
@@ -885,15 +914,25 @@ def build(repo_root: Path) -> None:
         total_entries=total_entries,
     )
     (site_dir / "robots.txt").write_text(build_robots_txt(), encoding="utf-8")
-    sitemap_date = build_date.date().isoformat()
-    sitemap_urls = [(SITE_URL, sitemap_date)]
-    sitemap_urls.extend((category_public_url(c), sitemap_date) for c in categories)
-    sitemap_urls.extend((group_public_url(g["slug"]), sitemap_date) for g in parsed_groups)
+    # Daily star and download refreshes are not significant changes, so lastmod follows commits to the page's own content.
+    build_day = build_date.date().isoformat()
+    readme_date = git_last_change_date(repo_root, "--", "README.md") or build_day
+    section_dates = {
+        c["slug"]: max(
+            git_last_change_date(repo_root, "-L", section_line_range(readme_text, c["name"])),
+            git_last_change_date(repo_root, "--", f"website/data/category_intros/{c['slug']}.md"),
+        )
+        or build_day
+        for c in categories
+    }
+    sitemap_urls = [(SITE_URL, readme_date)]
+    sitemap_urls.extend((category_public_url(c), section_dates[c["slug"]]) for c in categories)
+    sitemap_urls.extend((group_public_url(g["slug"]), max(section_dates[c["slug"]] for c in g["categories"])) for g in parsed_groups)
     if builtin_entries:
-        sitemap_urls.append((BUILTIN_PUBLIC_URL, sitemap_date))
+        sitemap_urls.append((BUILTIN_PUBLIC_URL, readme_date))
     for cat_slug, sub_slug, _ in sorted(subcat_meta.values()):
-        sitemap_urls.append((subcategory_public_url(cat_slug, sub_slug), sitemap_date))
-    sitemap_urls.append((SPONSORSHIP_PUBLIC_URL, sponsorship_md_mtime))
+        sitemap_urls.append((subcategory_public_url(cat_slug, sub_slug), section_dates[cat_slug]))
+    sitemap_urls.append((SPONSORSHIP_PUBLIC_URL, git_last_change_date(repo_root, "--", "SPONSORSHIP.md") or build_day))
     write_sitemap_xml(site_dir / "sitemap.xml", sitemap_urls)
     (site_dir / "llms.txt").write_text(llms_txt, encoding="utf-8")
 

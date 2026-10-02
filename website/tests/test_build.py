@@ -2,7 +2,9 @@
 
 import json
 import os
+import re
 import shutil
+import subprocess
 import textwrap
 import xml.etree.ElementTree as ET
 from datetime import UTC, date, datetime
@@ -14,6 +16,7 @@ from build import (
     TemplateEntry,
     annotate_entries_with_stats,
     build,
+    category_meta_title,
     detect_source_type,
     extract_entries,
     extract_github_repo,
@@ -197,9 +200,6 @@ class TestBuild:
             Help!
         """)
         self._make_repo(tmp_path, readme)
-        sponsorship_mtime = datetime(2024, 1, 2, tzinfo=UTC).timestamp()
-        os.utime(tmp_path / "SPONSORSHIP.md", (sponsorship_mtime, sponsorship_mtime))
-        expected_sponsorship_lastmod = "2024-01-02"
         start_date = datetime.now(UTC).date()
         build(tmp_path)
         end_date = datetime.now(UTC).date()
@@ -213,7 +213,6 @@ class TestBuild:
         ns = {"sitemap": "http://www.sitemaps.org/schemas/sitemap/0.9"}
         locs = [loc.text or "" for loc in root.findall("sitemap:url/sitemap:loc", ns)]
         lastmods = [lastmod.text or "" for lastmod in root.findall("sitemap:url/sitemap:lastmod", ns)]
-        lastmod_by_loc = dict(zip(locs, lastmods, strict=True))
 
         assert root.tag == "{http://www.sitemaps.org/schemas/sitemap/0.9}urlset"
         assert locs == [
@@ -224,10 +223,62 @@ class TestBuild:
             "https://awesome-python.com/sponsorship/",
         ]
         assert len(lastmods) == len(locs)
-        assert lastmod_by_loc["https://awesome-python.com/sponsorship/"] == expected_sponsorship_lastmod
-        assert all(start_date <= date.fromisoformat(lastmod) <= end_date for loc, lastmod in lastmod_by_loc.items() if loc != "https://awesome-python.com/sponsorship/")
+        # Outside a git repository every page falls back to the build date
+        assert all(start_date <= date.fromisoformat(lastmod) <= end_date for lastmod in lastmods)
         assert all(loc.startswith("https://awesome-python.com/") for loc in locs)
         assert all("?" not in loc for loc in locs)
+
+    def test_sitemap_lastmod_follows_git_history_of_each_page(self, tmp_path):
+        readme = textwrap.dedent("""\
+            # Awesome Python
+
+            Intro.
+
+            ## Projects
+
+            **Tools**
+
+            ### Widgets
+
+            - Sync
+
+                - [w1](https://example.com/w1) - A widget.
+
+            ### Gadgets
+
+            - [g1](https://example.com/g1) - A gadget.
+
+            ## Contributing
+
+            Help!
+        """)
+        self._make_repo(tmp_path, readme)
+
+        def commit(day, message):
+            env = {**os.environ, "GIT_AUTHOR_DATE": f"{day}T12:00:00Z", "GIT_COMMITTER_DATE": f"{day}T12:00:00Z"}
+            subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message], cwd=tmp_path, env=env, check=True)
+
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        commit("2024-01-01", "initial")
+        (tmp_path / "README.md").write_text(readme.replace("A gadget.", "A better gadget."), encoding="utf-8")
+        commit("2024-02-01", "edit gadgets")
+        intros_dir = tmp_path / "website" / "data" / "category_intros"
+        intros_dir.mkdir(parents=True)
+        (intros_dir / "widgets.md").write_text("Use w1.\n", encoding="utf-8")
+        commit("2024-03-01", "add widgets intro")
+        build(tmp_path)
+
+        sitemap = (tmp_path / "website" / "output" / "sitemap.xml").read_text(encoding="utf-8")
+        lastmod_by_loc = dict(re.findall(r"<loc>https://awesome-python\.com(\S*?)</loc>\s*<lastmod>(\S+)</lastmod>", sitemap))
+        assert lastmod_by_loc == {
+            "/": "2024-02-01",
+            "/categories/widgets/": "2024-03-01",
+            "/categories/gadgets/": "2024-02-01",
+            "/categories/tools/": "2024-03-01",
+            "/categories/widgets/sync/": "2024-03-01",
+            "/sponsorship/": "2024-01-01",
+        }
 
     def test_build_creates_category_pages_with_metadata_and_links(self, tmp_path):
         readme = textwrap.dedent("""\
@@ -743,7 +794,49 @@ class TestBuild:
         assert collection["name"] == "Python AI & ML Libraries"
         assert collection["@id"] == "https://awesome-python.com/categories/ai-ml/"
         assert collection["url"] == "https://awesome-python.com/categories/ai-ml/"
-        assert collection["description"] == "Explore 1 curated Python projects in AI & ML. Part of the Awesome Python catalog."
+        assert collection["description"] == "Explore 1 curated Python project in AI & ML. Part of the Awesome Python catalog."
+
+    def test_category_title_skips_libraries_after_plural_noun(self, tmp_path):
+        readme = textwrap.dedent("""\
+            # T
+
+            ## Projects
+
+            **Web Development**
+
+            ## Web Frameworks
+
+            - [wf1](https://example.com/wf1) - WF.
+
+            ## Web APIs
+
+            - [api1](https://example.com/api1) - API.
+
+            # Contributing
+
+            Done.
+        """)
+        self._copy_real_templates(tmp_path)
+        (tmp_path / "README.md").write_text(readme, encoding="utf-8")
+        build(tmp_path)
+
+        categories_dir = tmp_path / "website" / "output" / "categories"
+        frameworks_html = (categories_dir / "web-frameworks" / "index.html").read_text(encoding="utf-8")
+        apis_html = (categories_dir / "web-apis" / "index.html").read_text(encoding="utf-8")
+        parser = HeadMetadataParser()
+        parser.feed(frameworks_html)
+        marker = '<script type="application/ld+json">'
+        start = frameworks_html.index(marker) + len(marker)
+        end = frameworks_html.index("</script>", start)
+        graph = {node["@type"]: node for node in json.loads(frameworks_html[start:end])["@graph"]}
+
+        assert parser.title.strip() == "Python Web Frameworks - Awesome Python"
+        assert parser.meta_by_property["og:title"] == "Python Web Frameworks - Awesome Python"
+        assert graph["CollectionPage"]["name"] == "Python Web Frameworks"
+        assert "<title>Python Web APIs Libraries - Awesome Python</title>" in apis_html
+
+    def test_category_title_does_not_repeat_leading_python(self):
+        assert category_meta_title("Python Language") == "Python Language Libraries - Awesome Python"
 
     def test_build_creates_subcategory_pages(self, tmp_path):
         readme = textwrap.dedent("""\
@@ -811,14 +904,14 @@ class TestBuild:
 
         parser = HeadMetadataParser()
         parser.feed(sync)
-        assert parser.title.strip() == "Synchronous for Web Frameworks - Awesome Python"
-        assert parser.meta_by_name["description"] == "Explore 1 curated Python projects in Synchronous for Web Frameworks. Part of the Awesome Python catalog."
+        assert parser.title.strip() == "Python Web Frameworks: Synchronous - Awesome Python"
+        assert parser.meta_by_name["description"] == "The Synchronous picks in Awesome Python's Web Frameworks list: django."
 
         marker = '<script type="application/ld+json">'
         start = sync.index(marker) + len(marker)
         end = sync.index("</script>", start)
         graph = {node["@type"]: node for node in json.loads(sync[start:end])["@graph"]}
-        assert graph["CollectionPage"]["name"] == "Synchronous for Web Frameworks"
+        assert graph["CollectionPage"]["name"] == "Python Web Frameworks: Synchronous"
         assert graph["BreadcrumbList"]["itemListElement"] == [
             {"@type": "ListItem", "position": 1, "name": "Awesome Python", "item": "https://awesome-python.com/"},
             {
@@ -1104,6 +1197,39 @@ class TestBuild:
         assert html.count(">ml1</a") == 1
         assert "repeats-heading" not in html
         assert 'class="jump-links"' not in html
+
+    def test_group_page_shows_section_intro_lead_under_section_heading(self, tmp_path):
+        readme = textwrap.dedent("""\
+            # T
+
+            ## Projects
+
+            **AI & ML**
+
+            ## Machine Learning
+
+            - [ml1](https://example.com/ml1) - ML.
+
+            ## Deep Learning
+
+            - [dl1](https://example.com/dl1) - DL.
+
+            # Contributing
+
+            Done.
+        """)
+        self._copy_real_templates(tmp_path)
+        (tmp_path / "README.md").write_text(readme, encoding="utf-8")
+        intros_dir = tmp_path / "website" / "data" / "category_intros"
+        intros_dir.mkdir(parents=True)
+        (intros_dir / "machine-learning.md").write_text("Start with [`ml1`](https://example.com/ml1).\n\nMore detail.\n", encoding="utf-8")
+        build(tmp_path)
+
+        html = (tmp_path / "website" / "output" / "categories" / "ai-ml" / "index.html").read_text(encoding="utf-8")
+        lead = html.index('<div class="group-lead"><p>Start with <a href="https://example.com/ml1" target="_blank" rel="noopener"><code>ml1</code></a>.</p>')
+        assert html.index('<a href="/categories/machine-learning/">Machine Learning</a>') < lead < html.index(">ml1</a")
+        assert "More detail." not in html
+        assert html.count('class="group-lead"') == 1
 
     def test_build_rejects_redirect_to_missing_page(self, tmp_path):
         self._copy_real_templates(tmp_path)
@@ -1457,17 +1583,18 @@ class TestLoadCategoryIntro:
     def test_splits_after_how_to_choose_list(self, tmp_path):
         path = tmp_path / "widgets.md"
         path.write_text("Use `w1` for most apps.\n\nHow to choose:\n\n- Small apps: w1\n- Big apps: w2\n\nConfigure w1 once.\n\nPin w2.\n", encoding="utf-8")
-        intro_html, guide_html, lead = load_category_intro(path)
+        intro_html, guide_html, lead, lead_html = load_category_intro(path)
         assert intro_html == "<p>Use <code>w1</code> for most apps.</p>\n<p>How to choose:</p>\n<ul>\n<li>Small apps: w1</li>\n<li>Big apps: w2</li>\n</ul>\n"
         assert guide_html == "<p>Configure w1 once.</p>\n<p>Pin w2.</p>\n"
         assert lead == "Use w1 for most apps."
+        assert lead_html == "<p>Use <code>w1</code> for most apps.</p>\n"
 
     def test_keeps_everything_above_table_without_how_to_choose_list(self, tmp_path):
         path = tmp_path / "widgets.md"
         path.write_text("Use w1.\n\n- Small apps: w1\n\nConfigure w1 once.\n", encoding="utf-8")
-        intro_html, guide_html, _ = load_category_intro(path)
+        intro_html, guide_html, _, _ = load_category_intro(path)
         assert "Configure w1 once." in intro_html
         assert guide_html == ""
 
     def test_returns_empty_strings_without_intro_file(self, tmp_path):
-        assert load_category_intro(tmp_path / "missing.md") == ("", "", "")
+        assert load_category_intro(tmp_path / "missing.md") == ("", "", "", "")
